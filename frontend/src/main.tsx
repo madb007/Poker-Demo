@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client';
 import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom';
 import { SimulatorPage } from '@/components/SimulatorPage';
 import { BenchmarkPage } from '@/components/BenchmarkPage';
+import { PokerGameRoom } from '@/components/PokerGameRoom';
 import '@/styles/globals.css';
 
 const API_URL = 'http://localhost:5001';
@@ -52,6 +53,16 @@ const App: React.FC = () => {
               Simulator
             </Link>
             <Link 
+              to="/game" 
+              className={`px-4 py-2 rounded text-sm font-medium transition-colors ${
+                location.pathname === '/game' 
+                  ? 'bg-slate-100 text-slate-900' 
+                  : 'text-slate-300 hover:text-slate-100 hover:bg-slate-700'
+              }`}
+            >
+              Game Room
+            </Link>
+            <Link 
               to="/benchmark" 
               className={`px-4 py-2 rounded text-sm font-medium transition-colors ${
                 location.pathname === '/benchmark' 
@@ -69,6 +80,7 @@ const App: React.FC = () => {
         <div className="max-w-7xl mx-auto px-6 py-8">
           <Routes>
             <Route path="/" element={<SimulatorPage />} />
+            <Route path="/game" element={<PokerGameRoom />} />
             <Route path="/benchmark" element={<BenchmarkPage />} />
           </Routes>
         </div>
