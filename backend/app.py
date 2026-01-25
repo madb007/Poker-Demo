@@ -1,12 +1,15 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from typing import List, Dict
+from flask_socketio import SocketIO, emit, join_room, leave_room
+from typing import List, Dict, Optional
 from collections import Counter
 import random
+import uuid
+import threading
 
 # Import generators
 from pokerkit_generator import generate_hands_pokerkit
-from pyro_generator import generate_hands_pyro
+# from pyro_generator import generate_hands_pyro
 
 # Import PokerKit
 from pokerkit import Card, Rank, Suit, StandardHighHand, Deck
@@ -15,6 +18,13 @@ import itertools
 
 app = Flask(__name__)
 CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# In-memory storage for game tables and connections
+games = {}
+game_connections = {}  # Maps game_id to list of connected player names
+player_assignments = {}  # Maps (game_id, session_id) to player_id
+auto_deal_timers = {}  # Maps game_id to timer for auto-dealing next hand
 
 
 # Mapping from frontend format to PokerKit
@@ -61,6 +71,264 @@ def shuffle_deck(deck: List[Card]) -> List[Card]:
     shuffled = deck.copy()
     random.shuffle(shuffled)
     return shuffled
+
+
+def start_game(game_state: Dict) -> None:
+    """Start a poker game by dealing cards and initializing the first hand."""
+    # Promote pending players to active
+    for player in game_state["players"]:
+        if player.get("pending_active"):
+            player["is_active"] = True
+            player["pending_active"] = False
+
+    # Get indices of active players (maintains order, exclude pending)
+    active_indices = [i for i, p in enumerate(game_state["players"]) if p["is_active"] and not p.get("pending_active", False)]
+    
+    if len(active_indices) < 2:
+        return  # Need at least 2 players
+    
+    # Reset folded status and bets for all active players
+    for i in active_indices:
+        game_state["players"][i]["folded"] = False
+        game_state["players"][i]["current_bet"] = 0
+        game_state["players"][i]["acted_this_round"] = False
+    
+    # Reset community cards for new hand
+    game_state["community_cards"] = []
+    # Change game stage
+    game_state["game_stage"] = "pre_flop"
+    
+    # Create and shuffle deck
+    deck = shuffle_deck(create_deck())
+    
+    # Deal hole cards to each active player
+    card_index = 0
+    for i in active_indices:
+        game_state["players"][i]["hole_cards"] = [
+            card_to_dict(deck[card_index]),
+            card_to_dict(deck[card_index + 1])
+        ]
+        card_index += 2
+    
+    # Reset blind positions for all players first
+    for player in game_state["players"]:
+        player["is_dealer"] = False
+        player["is_small_blind"] = False
+        player["is_big_blind"] = False
+    
+    # Initialize pot
+    game_state["pot"] = 0
+    
+    # Set up blinds
+    if len(active_indices) >= 2:
+        if len(active_indices) == 2:
+            # Heads-up: first active player is dealer/small blind and acts first pre-flop
+            dealer_idx = active_indices[0]
+            big_blind_idx = active_indices[1]
+            game_state["players"][dealer_idx]["is_dealer"] = True
+            game_state["players"][dealer_idx]["is_small_blind"] = True
+            game_state["players"][big_blind_idx]["is_big_blind"] = True
+            # Post small blind
+            small_blind_amount = game_state["small_blind"]
+            game_state["players"][dealer_idx]["chips"] -= small_blind_amount
+            game_state["players"][dealer_idx]["current_bet"] = small_blind_amount
+            game_state["pot"] += small_blind_amount
+            # Post big blind
+            big_blind_amount = game_state["big_blind"]
+            game_state["players"][big_blind_idx]["chips"] -= big_blind_amount
+            game_state["players"][big_blind_idx]["current_bet"] = big_blind_amount
+            game_state["pot"] += big_blind_amount
+            # Dealer acts first in pre-flop
+            game_state["current_player_index"] = dealer_idx
+        else:
+            # Multi-player: dealer, then small blind, then big blind
+            dealer_idx = active_indices[0]
+            game_state["players"][dealer_idx]["is_dealer"] = True
+            # Small blind is next active player
+            small_blind_idx = active_indices[1]
+            game_state["players"][small_blind_idx]["is_small_blind"] = True
+            # Post small blind
+            small_blind_amount = game_state["small_blind"]
+            game_state["players"][small_blind_idx]["chips"] -= small_blind_amount
+            game_state["players"][small_blind_idx]["current_bet"] = small_blind_amount
+            game_state["pot"] += small_blind_amount
+            # Big blind is next active player
+            big_blind_idx = active_indices[2] if len(active_indices) > 2 else active_indices[0]
+            game_state["players"][big_blind_idx]["is_big_blind"] = True
+            # Post big blind
+            big_blind_amount = game_state["big_blind"]
+            game_state["players"][big_blind_idx]["chips"] -= big_blind_amount
+            game_state["players"][big_blind_idx]["current_bet"] = big_blind_amount
+            game_state["pot"] += big_blind_amount
+            # Current player to act is after big blind, but must be a valid active (non-pending) player
+            if len(active_indices) > 3:
+                game_state["current_player_index"] = active_indices[3]
+            else:
+                game_state["current_player_index"] = active_indices[0]
+    # Ensure current_player_index is always a valid active (non-pending) player
+    if game_state["current_player_index"] not in active_indices:
+        game_state["current_player_index"] = active_indices[0]
+    game_state["current_bet"] = game_state["big_blind"]
+
+
+def resolve_showdown(game_state: Dict) -> None:
+    """Determine winner at showdown and award pot."""
+    active_not_folded = [p for p in game_state["players"] if p["is_active"] and not p["folded"]]
+    
+    if len(active_not_folded) == 0:
+        return  # Should not happen
+    
+    if len(active_not_folded) == 1:
+        # One player left (others folded)
+        winner = active_not_folded[0]
+        winner["chips"] += game_state["pot"]
+        game_state["pot"] = 0
+        return
+    
+    # Multiple players still in - evaluate best hands
+    if len(game_state["community_cards"]) < 5:
+        # Board not complete yet, just award to first non-folded player
+        # (shouldn't normally happen)
+        winner = active_not_folded[0]
+        winner["chips"] += game_state["pot"]
+        game_state["pot"] = 0
+        return
+    
+    # Evaluate hands using PokerKit
+    board = [card_from_dict(c) for c in game_state["community_cards"]]
+    best_hand_value = None
+    winner = None
+    
+    for player in active_not_folded:
+        if not player["hole_cards"] or len(player["hole_cards"]) < 2:
+            continue
+        
+        hole_cards = [card_from_dict(c) for c in player["hole_cards"]]
+        hand = StandardHighHand.from_game(hole_cards, board)
+        
+        if best_hand_value is None or hand > best_hand_value:
+            best_hand_value = hand
+            winner = player
+    
+    if winner:
+        winner["chips"] += game_state["pot"]
+        game_state["pot"] = 0
+
+
+def is_betting_round_complete(game_state: Dict) -> bool:
+    """Check if the current betting round is complete."""
+    active_not_folded = [p for p in game_state["players"] if p["is_active"] and not p["folded"]]
+    
+    if len(active_not_folded) <= 1:
+        return True  # Everyone folded
+    
+    # Check if all players have acted and matched the current bet
+    for player in active_not_folded:
+        # Player hasn't acted yet this round
+        if not player.get("acted_this_round", False):
+            return False
+        # Player hasn't matched the current bet
+        if player["current_bet"] < game_state["current_bet"]:
+            return False
+    
+    return True
+    """Check if the current betting round is complete."""
+    active_not_folded = [p for p in game_state["players"] if p["is_active"] and not p["folded"]]
+    
+    if len(active_not_folded) <= 1:
+        return True  # Everyone folded
+    
+    # Check if all players have either folded or matched the current bet
+    for player in active_not_folded:
+        if player["current_bet"] < game_state["current_bet"]:
+            return False  # Someone hasn't matched the current bet
+    
+    return True
+
+
+def auto_deal_next_hand(game_id: str) -> None:
+    """Automatically deal the next hand after a delay."""
+    if game_id not in games:
+        return
+    
+    game_state = games[game_id]
+    start_game(game_state)
+    
+    # Broadcast the new game state
+    socketio.emit(
+        'game_state_update',
+        {'game_state': game_state},
+        room=game_id
+    )
+    
+    # Remove the timer from tracking
+    if game_id in auto_deal_timers:
+        del auto_deal_timers[game_id]
+
+
+def progress_betting_round(game_state: Dict) -> None:
+    """Move to the next betting round or showdown."""
+    # Check if only one player left
+    active_not_folded = [p for p in game_state["players"] if p["is_active"] and not p["folded"]]
+    if len(active_not_folded) <= 1:
+        game_state["game_stage"] = "showdown"
+        return
+    
+    # Reset bets for next round and update stage
+    for player in game_state["players"]:
+        if player["is_active"] and not player["folded"]:
+            player["current_bet"] = 0
+            player["acted_this_round"] = False
+    
+    game_state["current_bet"] = 0
+    
+    # Progress to next stage
+    if game_state["game_stage"] == "pre_flop":
+        # Deal flop (3 cards)
+        deck = shuffle_deck(create_deck())
+        # Convert all used cards to Card objects for comparison
+        used_card_objs = [card_from_dict(c) for c in game_state["community_cards"]]
+        used_card_objs += [card_from_dict(c) for p in game_state["players"] for c in p["hole_cards"] if c]
+        available = [c for c in deck if c not in used_card_objs]
+        game_state["community_cards"] = [card_to_dict(c) for c in available[:3]]
+        game_state["game_stage"] = "flop"
+        
+    elif game_state["game_stage"] == "flop":
+        # Deal turn (1 card)
+        deck = shuffle_deck(create_deck())
+        used_card_objs = [card_from_dict(c) for c in game_state["community_cards"]]
+        used_card_objs += [card_from_dict(c) for p in game_state["players"] for c in p["hole_cards"] if c]
+        available = [c for c in deck if c not in used_card_objs]
+        new_card = available[0]
+        game_state["community_cards"].append(card_to_dict(new_card))
+        game_state["game_stage"] = "turn"
+        
+    elif game_state["game_stage"] == "turn":
+        # Deal river (1 card)
+        deck = shuffle_deck(create_deck())
+        used_card_objs = [card_from_dict(c) for c in game_state["community_cards"]]
+        used_card_objs += [card_from_dict(c) for p in game_state["players"] for c in p["hole_cards"] if c]
+        available = [c for c in deck if c not in used_card_objs]
+        new_card = available[0]
+        game_state["community_cards"].append(card_to_dict(new_card))
+        game_state["game_stage"] = "river"
+        
+    elif game_state["game_stage"] == "river":
+        game_state["game_stage"] = "showdown"
+    
+    # Find first player to act in new round
+    active_not_folded = [p for p in game_state["players"] if p["is_active"] and not p["folded"]]
+    if active_not_folded and len(active_not_folded) > 1:
+        # Small blind acts first post-flop, otherwise find first non-dealer
+        small_blind_player = next((i for i, p in enumerate(game_state["players"]) if p["is_active"] and p.get("is_small_blind")), None)
+        if small_blind_player is not None:
+            game_state["current_player_index"] = small_blind_player
+        else:
+            # Fallback: find first non-dealer player
+            for i, player in enumerate(game_state["players"]):
+                if player["is_active"] and not player["folded"] and not player["is_dealer"]:
+                    game_state["current_player_index"] = i
+                    break
 
 
 # =============================================================================
@@ -167,6 +435,296 @@ def run_simulation(
         "hand_distribution": hand_distribution,
         "simulations_run": num_simulations,
     }
+
+
+# =============================================================================
+# Game Endpoints
+@app.route("/game/<game_id>/deal", methods=["POST"])
+def manual_deal_next_hand(game_id):
+    """Manually deal the next hand for a game."""
+    if game_id not in games:
+        return jsonify({"error": "Game not found"}), 404
+
+    game_state = games[game_id]
+    start_game(game_state)
+    games[game_id] = game_state
+
+    # Broadcast the new game state to all players in the room
+    socketio.emit(
+        'game_state_update',
+        {'game_state': game_state},
+        room=game_id
+    )
+
+    return jsonify(game_state)
+# =============================================================================
+
+@app.route("/game/new", methods=["POST"])
+def create_new_game():
+    """Create a new poker table."""
+    data = request.json or {}
+    
+    player_name = data.get("player_name", "Dealer")
+    num_players = min(max(data.get("num_players", 6), 2), 9)  # 2-9 players
+    starting_chips = data.get("starting_chips", 1000)
+    small_blind = data.get("small_blind", 5)
+    big_blind = data.get("big_blind", 10)
+    
+    game_id = str(uuid.uuid4())
+    
+    # Initialize game state
+    game_state = {
+        "game_id": game_id,
+        "community_cards": [],
+        "pot": 0,
+        "current_bet": 0,
+        "players": [
+            {
+                "id": 0,
+                "name": player_name,
+                "chips": starting_chips,
+                "hole_cards": [],
+                "is_dealer": True,
+                "is_small_blind": False,
+                "is_big_blind": False,
+                "is_active": True,
+                "current_bet": 0,
+                "folded": False
+            }
+        ],
+        "current_player_index": -1,
+        "game_stage": "waiting",
+        "small_blind": small_blind,
+        "big_blind": big_blind,
+        "max_players": num_players,
+        "starting_chips": starting_chips
+    }
+    
+    # Add placeholder seats for additional players
+    for i in range(1, num_players):
+        game_state["players"].append({
+            "id": i,
+            "name": f"Seat {i+1}",
+            "chips": starting_chips,
+            "hole_cards": [],
+            "is_dealer": False,
+            "is_small_blind": False,
+            "is_big_blind": False,
+            "is_active": False,
+            "current_bet": 0,
+            "folded": False
+        })
+    
+    games[game_id] = game_state
+    
+    # Return game state with player_id so frontend knows which player they are (creator is always 0)
+    response = dict(game_state)
+    response['player_id'] = 0
+    return jsonify(response)
+
+
+@app.route("/game/<game_id>", methods=["GET"])
+def get_game(game_id):
+    """Get current game state."""
+    if game_id not in games:
+        return jsonify({"error": "Game not found"}), 404
+    
+    return jsonify(games[game_id])
+
+
+@app.route("/game/<game_id>/join", methods=["POST"])
+def join_game(game_id):
+    """Join an existing game."""
+    if game_id not in games:
+        return jsonify({"error": "Game not found"}), 404
+
+    data = request.json or {}
+    player_name = data.get("player_name", "Player")
+
+    game_state = games[game_id]
+
+    # Find first available inactive seat
+    available_seat = None
+    available_seat_index = None
+    for idx, player in enumerate(game_state["players"]):
+        if not player["is_active"] and not player.get("pending_active", False):
+            available_seat = player
+            available_seat_index = idx
+            break
+
+    if available_seat is None:
+        return jsonify({"error": "No available seats"}), 400
+
+    # If hand is in progress, allow join but mark as pending
+    if game_state["game_stage"] != "waiting":
+        available_seat["is_active"] = False
+        available_seat["pending_active"] = True
+        available_seat["name"] = player_name
+    else:
+        available_seat["is_active"] = True
+        available_seat["pending_active"] = False
+        available_seat["name"] = player_name
+
+    # Only start the game when all seats are filled and game hasn't started
+    active_count = sum(1 for p in game_state["players"] if p["is_active"])
+    if active_count == game_state["max_players"] and game_state["game_stage"] == "waiting":
+        start_game(game_state)
+        # Broadcast updated game state after starting
+        socketio.emit(
+            'game_state_update',
+            {'game_state': game_state},
+            room=game_id
+        )
+
+    games[game_id] = game_state
+
+    # Broadcast to all connected players in this game (will be received after client joins room)
+    socketio.emit(
+        'player_joined',
+        {
+            'game_id': game_id,
+            'player_name': player_name,
+            'game_state': game_state
+        },
+        room=game_id
+    )
+
+    # Return game state with player_id so frontend knows which player they are
+    response = dict(game_state)
+    response['player_id'] = available_seat_index
+    return jsonify(response)
+
+
+
+@app.route("/game/<game_id>/action", methods=["POST"])
+def player_action(game_id):
+    """Handle player action (fold, check, call, raise) with No-Limit Hold'em rules."""
+    if game_id not in games:
+        return jsonify({"error": "Game not found"}), 404
+    
+    data = request.json or {}
+    player_id = data.get("player_id")
+    action = data.get("action", "")
+    amount = data.get("amount", 0)
+    
+    game_state = games[game_id]
+    
+    # Validate basic inputs
+    if player_id is None or not isinstance(player_id, int):
+        return jsonify({"error": "Player ID not assigned yet. Please wait for player_assigned event"}), 400
+    
+    if action not in ["fold", "check", "call", "raise"]:
+        return jsonify({"error": "Invalid action"}), 400
+    
+    if player_id >= len(game_state["players"]):
+        return jsonify({"error": "Invalid player ID"}), 400
+    
+    if player_id != game_state["current_player_index"]:
+        return jsonify({"error": "Not your turn"}), 400
+    
+    current_player = game_state["players"][player_id]
+    
+    if not current_player["is_active"]:
+        return jsonify({"error": "Player not active"}), 400
+    
+    # Validate actions for No-Limit Hold'em
+    if action == "fold":
+        current_player["folded"] = True
+        current_player["acted_this_round"] = True
+    
+    elif action == "check":
+        # Check is only valid if current bet equals player's current bet
+        if game_state["current_bet"] > current_player["current_bet"]:
+            return jsonify({"error": "Cannot check, must call or fold"}), 400
+        current_player["acted_this_round"] = True
+    
+    elif action == "call":
+        # Call the current bet
+        call_amount = game_state["current_bet"] - current_player["current_bet"]
+        if call_amount > current_player["chips"]:
+            return jsonify({"error": "Insufficient chips to call"}), 400
+        
+        current_player["chips"] -= call_amount
+        current_player["current_bet"] = game_state["current_bet"]
+        game_state["pot"] += call_amount
+        current_player["acted_this_round"] = True
+    
+    elif action == "raise":
+        # Raise amount is the total bet amount
+        min_raise = max(game_state["current_bet"] + game_state["big_blind"], game_state["current_bet"] * 2)
+        if amount < min_raise:
+            return jsonify({"error": f"Raise must be at least {min_raise}"}), 400
+        
+        bet_diff = amount - current_player["current_bet"]
+        if bet_diff > current_player["chips"]:
+            return jsonify({"error": "Insufficient chips to raise"}), 400
+        
+        current_player["chips"] -= bet_diff
+        current_player["current_bet"] = amount
+        game_state["current_bet"] = amount
+        game_state["pot"] += bet_diff
+        current_player["acted_this_round"] = True
+    
+    # Move to next player
+    active_players = [p for p in game_state["players"] if p["is_active"] and not p["folded"]]
+
+    # Check if only one player left (all others folded)
+    if len(active_players) <= 1:
+        game_state["game_stage"] = "showdown"
+    else:
+        # Check if betting round is complete
+        if is_betting_round_complete(game_state):
+            progress_betting_round(game_state)
+        else:
+            # Find next active player who has not acted this round
+            next_index = (game_state["current_player_index"] + 1) % len(game_state["players"])
+            found = False
+            attempts = 0
+            while attempts < len(game_state["players"]):
+                player = game_state["players"][next_index]
+                if (
+                    player["is_active"]
+                    and not player["folded"]
+                    and not player.get("acted_this_round", False)
+                ):
+                    game_state["current_player_index"] = next_index
+                    found = True
+                    break
+                next_index = (next_index + 1) % len(game_state["players"])
+                attempts += 1
+
+            if not found:
+                # All active players have acted, betting round should complete
+                progress_betting_round(game_state)
+    
+    games[game_id] = game_state
+    
+    # Broadcast to all players
+    socketio.emit(
+        'game_action',
+        {
+            'game_id': game_id,
+            'player_id': player_id,
+            'action': action,
+            'game_state': game_state
+        },
+        room=game_id
+    )
+    
+    # If game reached showdown, resolve it and schedule auto-deal for next hand in 10 seconds
+    if game_state["game_stage"] == "showdown":
+        resolve_showdown(game_state)
+        # Cancel any existing timer for this game
+        if game_id in auto_deal_timers:
+            auto_deal_timers[game_id].cancel()
+        
+        # Schedule new timer
+        timer = threading.Timer(10.0, auto_deal_next_hand, args=[game_id])
+        timer.daemon = True
+        timer.start()
+        auto_deal_timers[game_id] = timer
+    
+    return jsonify(game_state)
 
 
 @app.route("/health", methods=["GET"])
@@ -287,5 +845,108 @@ def evaluate():
     )
 
 
+# =============================================================================
+# WebSocket Events
+# =============================================================================
+
+@socketio.on('connect')
+def handle_connect():
+    """Handle client connection."""
+    print(f'Client connected: {request.sid}')
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Handle client disconnection."""
+    print(f'Client disconnected: {request.sid}')
+
+
+@socketio.on('join_game_room')
+def handle_join_game_room(data):
+    """Join a game room for real-time updates."""
+    game_id = data.get('game_id')
+    player_name = data.get('player_name')
+    player_id = data.get('player_id')  # Get the player_id from the client
+    
+    if not game_id:
+        emit('error', {'message': 'Game ID required'})
+        return
+    
+    if game_id not in games:
+        emit('error', {'message': 'Game not found'})
+        return
+    
+    # Join the socket room
+    join_room(game_id)
+    
+    # Track connection
+    if game_id not in game_connections:
+        game_connections[game_id] = []
+    if player_name not in game_connections[game_id]:
+        game_connections[game_id].append(player_name)
+    
+    # Validate player_id if provided, otherwise find it by name
+    game_state = games[game_id]
+    
+    # Convert player_id to int if it's a string
+    if isinstance(player_id, str):
+        try:
+            player_id = int(player_id)
+        except (ValueError, TypeError):
+            player_id = None
+    
+    # Use provided player_id if it's valid
+    if isinstance(player_id, int) and 0 <= player_id < len(game_state["players"]) and game_state["players"][player_id]["is_active"]:
+        # player_id is valid and points to an active player, use it
+        pass
+    else:
+        # Fallback: find by name (only if player_id wasn't provided or was invalid)
+        player_id = None
+        for idx, player in enumerate(game_state["players"]):
+            if player["name"] == player_name and player["is_active"]:
+                player_id = idx
+                break
+    
+    # Store the player_id assignment for this session
+    player_assignments[(game_id, request.sid)] = player_id
+    
+    # Send player_id back to the client
+    emit('player_assigned', {
+        'player_id': player_id,
+        'player_name': player_name,
+        'game_id': game_id
+    })
+    
+    # Notify others in the room
+    emit('player_connected', {
+        'player_name': player_name,
+        'game_id': game_id,
+        'connected_players': game_connections.get(game_id, [])
+    }, room=game_id)
+    
+    # Send current game state only if game has started
+    if games[game_id]["game_stage"] != "waiting":
+        emit('game_state_update', {'game_state': games[game_id]})
+
+
+@socketio.on('leave_game_room')
+def handle_leave_game_room(data):
+    """Leave a game room."""
+    game_id = data.get('game_id')
+    player_name = data.get('player_name')
+    
+    if game_id and game_id in game_connections:
+        if player_name in game_connections[game_id]:
+            game_connections[game_id].remove(player_name)
+        
+        leave_room(game_id)
+        
+        emit('player_disconnected', {
+            'player_name': player_name,
+            'game_id': game_id,
+            'connected_players': game_connections.get(game_id, [])
+        }, room=game_id)
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=True)
+    socketio.run(app, host="0.0.0.0", port=5001, debug=True)
