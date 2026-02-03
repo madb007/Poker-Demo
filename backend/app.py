@@ -6,8 +6,6 @@ from collections import Counter
 import random
 import uuid
 import threading
-import os
-import json
 import urllib.request
 
 # Import generators
@@ -16,7 +14,18 @@ from pokerkit_generator import generate_hands_pokerkit
 
 # Import PokerKit
 from pokerkit import Card, Rank, Suit, StandardHighHand, Deck
-import itertools
+
+from llm_client import LLMClient
+from players import (
+    PLAYER_TYPE_HUMAN,
+    PLAYER_TYPE_DEMO,
+    PLAYER_TYPE_LLM,
+    PLAYER_TYPE_OPEN,
+    create_player,
+    is_bot_player,
+    demo_bot_action,
+    llm_bot_action,
+)
 
 
 app = Flask(__name__)
@@ -30,10 +39,7 @@ player_assignments = {}  # Maps (game_id, session_id) to player_id
 auto_deal_timers = {}  # Maps game_id to timer for auto-dealing next hand
 bot_action_timers = {}  # Maps game_id to timer for bot actions
 
-# Player types
-PLAYER_TYPE_HUMAN = "human"
-PLAYER_TYPE_DEMO = "demo"
-PLAYER_TYPE_LLM = "llm"
+llm_client = LLMClient()
 
 
 # Mapping from frontend format to PokerKit
@@ -84,6 +90,8 @@ def shuffle_deck(deck: List[Card]) -> List[Card]:
 
 def start_game(game_state: Dict) -> None:
     """Start a poker game by dealing cards and initializing the first hand."""
+    if game_state.get("game_over"):
+        return
     # Promote pending players to active
     for player in game_state["players"]:
         if player.get("pending_active"):
@@ -101,6 +109,7 @@ def start_game(game_state: Dict) -> None:
         game_state["players"][i]["folded"] = False
         game_state["players"][i]["current_bet"] = 0
         game_state["players"][i]["acted_this_round"] = False
+        game_state["players"][i]["last_action"] = None
     
     # Reset community cards for new hand
     game_state["community_cards"] = []
@@ -127,6 +136,9 @@ def start_game(game_state: Dict) -> None:
     
     # Initialize pot
     game_state["pot"] = 0
+    game_state["action_log"] = []
+    game_state["hand_number"] = game_state.get("hand_number", 0) + 1
+    record_action(game_state, None, "hand_start", 0, note=f"Hand {game_state['hand_number']}")
     
     # Set up blinds
     if len(active_indices) >= 2:
@@ -142,11 +154,13 @@ def start_game(game_state: Dict) -> None:
             game_state["players"][dealer_idx]["chips"] -= small_blind_amount
             game_state["players"][dealer_idx]["current_bet"] = small_blind_amount
             game_state["pot"] += small_blind_amount
+            record_action(game_state, dealer_idx, "blind", small_blind_amount, note="small_blind")
             # Post big blind
             big_blind_amount = game_state["big_blind"]
             game_state["players"][big_blind_idx]["chips"] -= big_blind_amount
             game_state["players"][big_blind_idx]["current_bet"] = big_blind_amount
             game_state["pot"] += big_blind_amount
+            record_action(game_state, big_blind_idx, "blind", big_blind_amount, note="big_blind")
             # Dealer acts first in pre-flop
             game_state["current_player_index"] = dealer_idx
         else:
@@ -161,6 +175,7 @@ def start_game(game_state: Dict) -> None:
             game_state["players"][small_blind_idx]["chips"] -= small_blind_amount
             game_state["players"][small_blind_idx]["current_bet"] = small_blind_amount
             game_state["pot"] += small_blind_amount
+            record_action(game_state, small_blind_idx, "blind", small_blind_amount, note="small_blind")
             # Big blind is next active player
             big_blind_idx = active_indices[2] if len(active_indices) > 2 else active_indices[0]
             game_state["players"][big_blind_idx]["is_big_blind"] = True
@@ -169,6 +184,7 @@ def start_game(game_state: Dict) -> None:
             game_state["players"][big_blind_idx]["chips"] -= big_blind_amount
             game_state["players"][big_blind_idx]["current_bet"] = big_blind_amount
             game_state["pot"] += big_blind_amount
+            record_action(game_state, big_blind_idx, "blind", big_blind_amount, note="big_blind")
             # Current player to act is after big blind, but must be a valid active (non-pending) player
             if len(active_indices) > 3:
                 game_state["current_player_index"] = active_indices[3]
@@ -191,6 +207,7 @@ def resolve_showdown(game_state: Dict) -> None:
         # One player left (others folded)
         winner = active_not_folded[0]
         winner["chips"] += game_state["pot"]
+        record_action(game_state, winner["id"], "win", game_state["pot"], note="by_fold")
         game_state["pot"] = 0
         return
     
@@ -200,6 +217,7 @@ def resolve_showdown(game_state: Dict) -> None:
         # (shouldn't normally happen)
         winner = active_not_folded[0]
         winner["chips"] += game_state["pot"]
+        record_action(game_state, winner["id"], "win", game_state["pot"], note="incomplete_board")
         game_state["pot"] = 0
         return
     
@@ -207,6 +225,8 @@ def resolve_showdown(game_state: Dict) -> None:
     board = [card_from_dict(c) for c in game_state["community_cards"]]
     best_hand_value = None
     winner = None
+    winner_hand = None
+    winner_hand_name = None
     
     for player in active_not_folded:
         if not player["hole_cards"] or len(player["hole_cards"]) < 2:
@@ -218,10 +238,26 @@ def resolve_showdown(game_state: Dict) -> None:
         if best_hand_value is None or hand > best_hand_value:
             best_hand_value = hand
             winner = player
+            winner_hand = hand
+            winner_hand_name = str(hand).split("(")[0].strip()
     
     if winner:
         winner["chips"] += game_state["pot"]
+        record_action(
+            game_state,
+            winner["id"],
+            "win",
+            game_state["pot"],
+            note=f"showdown:{winner_hand_name}" if winner_hand_name else "showdown",
+        )
+        if winner_hand is not None:
+            game_state["showdown"] = {
+                "winner_id": winner["id"],
+                "hand_name": winner_hand_name,
+                "hand_description": str(winner_hand),
+            }
         game_state["pot"] = 0
+    update_busts_and_winner(game_state)
 
 
 def is_betting_round_complete(game_state: Dict) -> bool:
@@ -241,18 +277,6 @@ def is_betting_round_complete(game_state: Dict) -> bool:
             return False
     
     return True
-    """Check if the current betting round is complete."""
-    active_not_folded = [p for p in game_state["players"] if p["is_active"] and not p["folded"]]
-    
-    if len(active_not_folded) <= 1:
-        return True  # Everyone folded
-    
-    # Check if all players have either folded or matched the current bet
-    for player in active_not_folded:
-        if player["current_bet"] < game_state["current_bet"]:
-            return False  # Someone hasn't matched the current bet
-    
-    return True
 
 
 def auto_deal_next_hand(game_id: str) -> None:
@@ -261,6 +285,8 @@ def auto_deal_next_hand(game_id: str) -> None:
         return
     
     game_state = games[game_id]
+    if game_state.get("game_over"):
+        return
     start_game(game_state)
     
     # Broadcast the new game state
@@ -283,6 +309,7 @@ def progress_betting_round(game_state: Dict) -> None:
     active_not_folded = [p for p in game_state["players"] if p["is_active"] and not p["folded"]]
     if len(active_not_folded) <= 1:
         game_state["game_stage"] = "showdown"
+        record_action(game_state, None, "stage", 0, note="showdown")
         return
     
     # Reset bets for next round and update stage
@@ -303,6 +330,7 @@ def progress_betting_round(game_state: Dict) -> None:
         available = [c for c in deck if c not in used_card_objs]
         game_state["community_cards"] = [card_to_dict(c) for c in available[:3]]
         game_state["game_stage"] = "flop"
+        record_action(game_state, None, "stage", 0, note="flop")
         
     elif game_state["game_stage"] == "flop":
         # Deal turn (1 card)
@@ -313,6 +341,7 @@ def progress_betting_round(game_state: Dict) -> None:
         new_card = available[0]
         game_state["community_cards"].append(card_to_dict(new_card))
         game_state["game_stage"] = "turn"
+        record_action(game_state, None, "stage", 0, note="turn")
         
     elif game_state["game_stage"] == "turn":
         # Deal river (1 card)
@@ -323,9 +352,11 @@ def progress_betting_round(game_state: Dict) -> None:
         new_card = available[0]
         game_state["community_cards"].append(card_to_dict(new_card))
         game_state["game_stage"] = "river"
+        record_action(game_state, None, "stage", 0, note="river")
         
     elif game_state["game_stage"] == "river":
         game_state["game_stage"] = "showdown"
+        record_action(game_state, None, "stage", 0, note="showdown")
     
     # Find first player to act in new round
     active_not_folded = [p for p in game_state["players"] if p["is_active"] and not p["folded"]]
@@ -342,146 +373,25 @@ def progress_betting_round(game_state: Dict) -> None:
                     break
 
 
-def is_bot_player(player: Dict) -> bool:
-    return player.get("player_type") in {PLAYER_TYPE_DEMO, PLAYER_TYPE_LLM}
-
-
-def compute_valid_actions(game_state: Dict, player: Dict) -> Dict:
-    valid = ["fold"]
-    if game_state["current_bet"] == player["current_bet"]:
-        valid.append("check")
-    else:
-        valid.append("call")
-
-    min_raise = max(
-        game_state["current_bet"] + game_state["big_blind"],
-        game_state["current_bet"] * 2
-    )
-    max_raise = player["current_bet"] + player["chips"]
-
-    if max_raise >= min_raise and player["chips"] > 0:
-        valid.append("raise")
-
-    return {
-        "valid_actions": valid,
-        "min_raise": min_raise,
-        "max_raise": max_raise
+def record_action(game_state: Dict, player_id: Optional[int], action: str, amount: int, note: Optional[str] = None) -> None:
+    entry = {
+        "player_id": player_id,
+        "action": action,
+        "amount": amount,
+        "note": note,
+        "hand_number": game_state.get("hand_number", 0),
     }
+    log = game_state.setdefault("action_log", [])
+    log.append(entry)
+    if len(log) > 200:
+        del log[: len(log) - 200]
 
-
-def safe_default_action(game_state: Dict, player: Dict) -> Dict:
-    action_info = compute_valid_actions(game_state, player)
-    if "check" in action_info["valid_actions"]:
-        return {"action": "check", "amount": 0}
-    if "call" in action_info["valid_actions"]:
-        return {"action": "call", "amount": 0}
-    return {"action": "fold", "amount": 0}
-
-
-def demo_bot_action(game_state: Dict, player: Dict) -> Dict:
-    # Placeholder policy - replace with your probabilistic demo logic.
-    return safe_default_action(game_state, player)
-
-
-def call_ollama(messages: list) -> Optional[str]:
-    model = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
-    payload = json.dumps({
-        "model": model,
-        "messages": messages,
-        "stream": False
-    }).encode("utf-8")
-
-    try:
-        req = urllib.request.Request(
-            "http://localhost:11434/api/chat",
-            data=payload,
-            headers={"Content-Type": "application/json"}
-        )
-        with urllib.request.urlopen(req, timeout=8) as res:
-            body = json.loads(res.read().decode("utf-8"))
-            return body.get("message", {}).get("content", "")
-    except Exception:
-        return None
-
-
-def parse_llm_action(text: str) -> Optional[Dict]:
-    if not text:
-        return None
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    # Try to extract JSON object from free-form text
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        try:
-            return json.loads(text[start:end + 1])
-        except Exception:
-            return None
-    return None
-
-
-def llm_bot_action(game_state: Dict, player: Dict) -> Dict:
-    action_info = compute_valid_actions(game_state, player)
-    prompt_payload = {
-        "player_id": player["id"],
-        "player_name": player["name"],
-        "player_chips": player["chips"],
-        "player_current_bet": player["current_bet"],
-        "player_hole_cards": player.get("hole_cards", []),
-        "community_cards": game_state["community_cards"],
-        "pot": game_state["pot"],
-        "current_bet": game_state["current_bet"],
-        "min_raise": action_info["min_raise"],
-        "max_raise": action_info["max_raise"],
-        "valid_actions": action_info["valid_actions"],
-        "game_stage": game_state["game_stage"],
-        "opponents": [
-            {
-                "id": p["id"],
-                "name": p["name"],
-                "chips": p["chips"],
-                "folded": p["folded"],
-                "current_bet": p["current_bet"]
-            }
-            for p in game_state["players"] if p["id"] != player["id"]
-        ],
-        "blinds": {
-            "small_blind": game_state["small_blind"],
-            "big_blind": game_state["big_blind"]
+    if player_id is not None and 0 <= player_id < len(game_state["players"]):
+        game_state["players"][player_id]["last_action"] = {
+            "action": action,
+            "amount": amount,
+            "note": note,
         }
-    }
-
-    system = "You are a poker bot. Return ONLY valid JSON: {\"action\":\"fold|check|call|raise\",\"amount\":number|null,\"reason\":string}."
-    user = f"State: {json.dumps(prompt_payload)}"
-
-    content = call_ollama([
-        {"role": "system", "content": system},
-        {"role": "user", "content": user}
-    ])
-
-    parsed = parse_llm_action(content or "")
-    if not parsed:
-        return safe_default_action(game_state, player)
-
-    action = parsed.get("action")
-    amount = parsed.get("amount", 0)
-
-    if action not in action_info["valid_actions"]:
-        return safe_default_action(game_state, player)
-
-    if action == "raise":
-        try:
-            amount_val = int(amount)
-        except Exception:
-            return safe_default_action(game_state, player)
-        if amount_val < action_info["min_raise"] or amount_val > action_info["max_raise"]:
-            return safe_default_action(game_state, player)
-        return {"action": "raise", "amount": amount_val}
-
-    return {"action": action, "amount": 0}
 
 
 def maybe_trigger_bot_turn(game_id: str) -> None:
@@ -490,6 +400,7 @@ def maybe_trigger_bot_turn(game_id: str) -> None:
     game_state = games[game_id]
     if game_state["game_stage"] in {"waiting", "showdown"}:
         return
+    ensure_current_player_actionable(game_state, advance=True)
     current_idx = game_state.get("current_player_index", -1)
     if current_idx < 0 or current_idx >= len(game_state["players"]):
         return
@@ -521,7 +432,7 @@ def bot_take_action(game_id: str) -> None:
     if player.get("player_type") == PLAYER_TYPE_DEMO:
         action_payload = demo_bot_action(game_state, player)
     else:
-        action_payload = llm_bot_action(game_state, player)
+        action_payload = llm_bot_action(game_state, player, llm_client)
 
     process_player_action(
         game_id=game_id,
@@ -534,6 +445,10 @@ def bot_take_action(game_id: str) -> None:
 
 def process_player_action(game_id: str, player_id: int, action: str, amount: int, emit_events: bool = True):
     game_state = games[game_id]
+
+    if game_state.get("game_over"):
+        return None, "Game over"
+    ensure_current_player_actionable(game_state, advance=True)
 
     if player_id is None or not isinstance(player_id, int):
         return None, "Player ID not assigned yet. Please wait for player_assigned event"
@@ -551,15 +466,19 @@ def process_player_action(game_id: str, player_id: int, action: str, amount: int
 
     if not current_player["is_active"]:
         return None, "Player not active"
+    if current_player["folded"]:
+        return None, "Player already folded"
 
     if action == "fold":
         current_player["folded"] = True
         current_player["acted_this_round"] = True
+        record_action(game_state, player_id, "fold", 0)
 
     elif action == "check":
         if game_state["current_bet"] > current_player["current_bet"]:
             return None, "Cannot check, must call or fold"
         current_player["acted_this_round"] = True
+        record_action(game_state, player_id, "check", 0)
 
     elif action == "call":
         call_amount = game_state["current_bet"] - current_player["current_bet"]
@@ -570,6 +489,7 @@ def process_player_action(game_id: str, player_id: int, action: str, amount: int
         current_player["current_bet"] = game_state["current_bet"]
         game_state["pot"] += call_amount
         current_player["acted_this_round"] = True
+        record_action(game_state, player_id, "call", call_amount)
 
     elif action == "raise":
         min_raise = max(game_state["current_bet"] + game_state["big_blind"], game_state["current_bet"] * 2)
@@ -585,6 +505,10 @@ def process_player_action(game_id: str, player_id: int, action: str, amount: int
         game_state["current_bet"] = amount
         game_state["pot"] += bet_diff
         current_player["acted_this_round"] = True
+        record_action(game_state, player_id, "raise", bet_diff, note=f"to_{amount}")
+        for idx, player in enumerate(game_state["players"]):
+            if idx != player_id and player["is_active"] and not player["folded"]:
+                player["acted_this_round"] = False
 
     active_players = [p for p in game_state["players"] if p["is_active"] and not p["folded"]]
 
@@ -594,24 +518,7 @@ def process_player_action(game_id: str, player_id: int, action: str, amount: int
         if is_betting_round_complete(game_state):
             progress_betting_round(game_state)
         else:
-            next_index = (game_state["current_player_index"] + 1) % len(game_state["players"])
-            found = False
-            attempts = 0
-            while attempts < len(game_state["players"]):
-                player = game_state["players"][next_index]
-                if (
-                    player["is_active"]
-                    and not player["folded"]
-                    and not player.get("acted_this_round", False)
-                ):
-                    game_state["current_player_index"] = next_index
-                    found = True
-                    break
-                next_index = (next_index + 1) % len(game_state["players"])
-                attempts += 1
-
-            if not found:
-                progress_betting_round(game_state)
+            ensure_current_player_actionable(game_state, advance=True)
 
     games[game_id] = game_state
 
@@ -629,6 +536,10 @@ def process_player_action(game_id: str, player_id: int, action: str, amount: int
 
     if game_state["game_stage"] == "showdown":
         resolve_showdown(game_state)
+        update_busts_and_winner(game_state)
+        if game_state.get("game_over"):
+            games[game_id] = game_state
+            return game_state, None
         if game_id in auto_deal_timers:
             auto_deal_timers[game_id].cancel()
 
@@ -640,6 +551,54 @@ def process_player_action(game_id: str, player_id: int, action: str, amount: int
         maybe_trigger_bot_turn(game_id)
 
     return game_state, None
+
+
+def ensure_current_player_actionable(game_state: Dict, advance: bool = False) -> None:
+    active_not_folded = [p for p in game_state["players"] if p["is_active"] and not p["folded"]]
+    if len(active_not_folded) <= 1:
+        game_state["game_stage"] = "showdown"
+        return
+
+    current_idx = game_state.get("current_player_index", -1)
+    if 0 <= current_idx < len(game_state["players"]):
+        current_player = game_state["players"][current_idx]
+        if current_player["is_active"] and not current_player["folded"] and not current_player.get("acted_this_round", False):
+            return
+
+    if not advance:
+        return
+
+    start = current_idx if current_idx >= 0 else 0
+    next_index = (start + 1) % len(game_state["players"])
+    attempts = 0
+    while attempts < len(game_state["players"]):
+        player = game_state["players"][next_index]
+        if player["is_active"] and not player["folded"] and not player.get("acted_this_round", False):
+            game_state["current_player_index"] = next_index
+            return
+        next_index = (next_index + 1) % len(game_state["players"])
+        attempts += 1
+
+    progress_betting_round(game_state)
+
+
+def update_busts_and_winner(game_state: Dict) -> None:
+    for player in game_state["players"]:
+        if player["is_active"] and player["chips"] <= 0:
+            player["is_active"] = False
+            player["folded"] = True
+            player["pending_active"] = False
+            record_action(game_state, player["id"], "bust", 0)
+
+    active_players = [p for p in game_state["players"] if p["is_active"]]
+    if len(active_players) == 1:
+        winner = active_players[0]
+        game_state["game_over"] = True
+        game_state["winner_id"] = winner["id"]
+        record_action(game_state, winner["id"], "winner", winner["chips"])
+    elif len(active_players) == 0:
+        game_state["game_over"] = True
+        game_state["winner_id"] = None
 
 
 # =============================================================================
@@ -776,39 +735,109 @@ def create_new_game():
     data = request.json or {}
     
     player_name = data.get("player_name", "Dealer")
-    num_players = min(max(data.get("num_players", 6), 2), 9)  # 2-9 players
     starting_chips = data.get("starting_chips", 1000)
     small_blind = data.get("small_blind", 5)
     big_blind = data.get("big_blind", 10)
+    seat_plan = data.get("seat_plan")
+
+    if not seat_plan:
+        open_seats = data.get("open_seats")
+        demo_seats = data.get("demo_seats")
+        llm_seats = data.get("llm_seats")
+        if any(x is not None for x in [open_seats, demo_seats, llm_seats]):
+            open_seats = int(open_seats or 0)
+            demo_seats = int(demo_seats or 0)
+            llm_seats = int(llm_seats or 0)
+            seat_plan = (
+                [PLAYER_TYPE_HUMAN]
+                + [PLAYER_TYPE_OPEN] * max(open_seats, 0)
+                + [PLAYER_TYPE_DEMO] * max(demo_seats, 0)
+                + [PLAYER_TYPE_LLM] * max(llm_seats, 0)
+            )
+        else:
+            num_players = min(max(data.get("num_players", 6), 2), 9)  # 2-9 players
+            seat_plan = [PLAYER_TYPE_HUMAN]
+            if num_players >= 2:
+                seat_plan.append(PLAYER_TYPE_DEMO)
+            for _ in range(max(num_players - 2, 0)):
+                seat_plan.append(PLAYER_TYPE_LLM)
+
+    if not isinstance(seat_plan, list):
+        seat_plan = [PLAYER_TYPE_HUMAN, PLAYER_TYPE_DEMO]
+
+    seat_plan = [str(seat).lower() for seat in seat_plan]
+    if len(seat_plan) < 2:
+        seat_plan += [PLAYER_TYPE_OPEN] * (2 - len(seat_plan))
+    if len(seat_plan) > 9:
+        seat_plan = seat_plan[:9]
     
     game_id = str(uuid.uuid4())
     
     players = []
-    for i in range(num_players):
-        if i == 0:
-            player_type = PLAYER_TYPE_HUMAN
-            name = player_name
-        elif i == 1:
-            player_type = PLAYER_TYPE_DEMO
-            name = "Demo Bot"
+    creator_assigned = False
+    creator_id = 0
+    demo_idx = 1
+    llm_idx = 1
+    for i, seat_type in enumerate(seat_plan):
+        if seat_type in {PLAYER_TYPE_OPEN, PLAYER_TYPE_HUMAN} and not creator_assigned:
+            players.append(
+                create_player(
+                    seat_id=i,
+                    name=player_name,
+                    player_type=PLAYER_TYPE_HUMAN,
+                    starting_chips=starting_chips,
+                    is_active=True,
+                    seat_type=PLAYER_TYPE_HUMAN,
+                )
+            )
+            creator_assigned = True
+            creator_id = i
+        elif seat_type == PLAYER_TYPE_DEMO:
+            players.append(
+                create_player(
+                    seat_id=i,
+                    name=f"Demo Bot {demo_idx}",
+                    player_type=PLAYER_TYPE_DEMO,
+                    starting_chips=starting_chips,
+                    is_active=True,
+                    seat_type=PLAYER_TYPE_DEMO,
+                )
+            )
+            demo_idx += 1
+        elif seat_type == PLAYER_TYPE_LLM:
+            players.append(
+                create_player(
+                    seat_id=i,
+                    name=f"LLM Bot {llm_idx}",
+                    player_type=PLAYER_TYPE_LLM,
+                    starting_chips=starting_chips,
+                    is_active=True,
+                    seat_type=PLAYER_TYPE_LLM,
+                )
+            )
+            llm_idx += 1
         else:
-            player_type = PLAYER_TYPE_LLM
-            name = f"LLM Bot {i - 1}"
+            players.append(
+                create_player(
+                    seat_id=i,
+                    name=f"Open Seat {i + 1}",
+                    player_type=PLAYER_TYPE_OPEN,
+                    starting_chips=starting_chips,
+                    is_active=False,
+                    seat_type=PLAYER_TYPE_OPEN,
+                )
+            )
 
-        players.append({
-            "id": i,
-            "name": name,
-            "player_type": player_type,
-            "chips": starting_chips,
-            "hole_cards": [],
-            "is_dealer": False,
-            "is_small_blind": False,
-            "is_big_blind": False,
-            "is_active": True,
-            "pending_active": False,
-            "current_bet": 0,
-            "folded": False
-        })
+    if not creator_assigned and players:
+        players[0] = create_player(
+            seat_id=0,
+            name=player_name,
+            player_type=PLAYER_TYPE_HUMAN,
+            starting_chips=starting_chips,
+            is_active=True,
+            seat_type=PLAYER_TYPE_HUMAN,
+        )
+        creator_id = 0
 
     # Initialize game state
     game_state = {
@@ -821,11 +850,16 @@ def create_new_game():
         "game_stage": "waiting",
         "small_blind": small_blind,
         "big_blind": big_blind,
-        "max_players": num_players,
-        "starting_chips": starting_chips
+        "max_players": len(players),
+        "starting_chips": starting_chips,
+        "hand_number": 0,
+        "action_log": [],
+        "game_over": False,
+        "winner_id": None
     }
     
-    if len(players) >= 2:
+    active_count = sum(1 for p in players if p["is_active"])
+    if active_count >= 2:
         start_game(game_state)
 
     games[game_id] = game_state
@@ -833,7 +867,7 @@ def create_new_game():
     
     # Return game state with player_id so frontend knows which player they are (creator is always 0)
     response = dict(game_state)
-    response['player_id'] = 0
+    response['player_id'] = creator_id
     return jsonify(response)
 
 
@@ -856,12 +890,18 @@ def join_game(game_id):
     player_name = data.get("player_name", "Player")
 
     game_state = games[game_id]
+    if game_state.get("game_over"):
+        return jsonify({"error": "Game is over"}), 400
 
-    # Find first available inactive seat
+    # Find first open seat
     available_seat = None
     available_seat_index = None
     for idx, player in enumerate(game_state["players"]):
-        if not player["is_active"] and not player.get("pending_active", False):
+        if (
+            player.get("seat_type") == PLAYER_TYPE_OPEN
+            and not player["is_active"]
+            and not player.get("pending_active", False)
+        ):
             available_seat = player
             available_seat_index = idx
             break
@@ -873,15 +913,20 @@ def join_game(game_id):
     if game_state["game_stage"] != "waiting":
         available_seat["is_active"] = False
         available_seat["pending_active"] = True
-        available_seat["name"] = player_name
     else:
         available_seat["is_active"] = True
         available_seat["pending_active"] = False
-        available_seat["name"] = player_name
+
+    available_seat["name"] = player_name
+    available_seat["player_type"] = PLAYER_TYPE_HUMAN
+    available_seat["seat_type"] = PLAYER_TYPE_HUMAN
+    available_seat["folded"] = False
+    available_seat["acted_this_round"] = False
+    available_seat["last_action"] = None
 
     # Only start the game when all seats are filled and game hasn't started
     active_count = sum(1 for p in game_state["players"] if p["is_active"])
-    if active_count == game_state["max_players"] and game_state["game_stage"] == "waiting":
+    if active_count >= 2 and game_state["game_stage"] == "waiting":
         start_game(game_state)
         # Broadcast updated game state after starting
         socketio.emit(

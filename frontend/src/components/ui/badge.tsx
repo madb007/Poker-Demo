@@ -16,6 +16,8 @@ const badgeVariants = cva(
           "border-amber-700/70 bg-amber-900/30 text-amber-200",
         llm:
           "border-emerald-700/70 bg-emerald-900/30 text-emerald-200",
+        open:
+          "border-slate-500/70 bg-slate-900/30 text-slate-300",
       },
     },
     defaultVariants: {

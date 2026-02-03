@@ -14,15 +14,22 @@ interface Card {
 interface Player {
   id: number;
   name: string;
-  player_type?: 'human' | 'demo' | 'llm';
+  player_type?: 'human' | 'demo' | 'llm' | 'open';
+  seat_type?: 'human' | 'demo' | 'llm' | 'open';
   chips: number;
   hole_cards: Card[];
   is_dealer: boolean;
   is_small_blind: boolean;
   is_big_blind: boolean;
   is_active: boolean;
+  pending_active?: boolean;
   current_bet: number;
   folded: boolean;
+  last_action?: {
+    action: string;
+    amount: number;
+    note?: string | null;
+  } | null;
 }
 
 interface GameState {
@@ -35,6 +42,19 @@ interface GameState {
   game_stage: 'pre_flop' | 'flop' | 'turn' | 'river' | 'showdown' | 'waiting';
   small_blind: number;
   big_blind: number;
+  action_log?: Array<{
+    player_id: number | null;
+    action: string;
+    amount: number;
+    note?: string | null;
+    hand_number?: number;
+  }>;
+  hand_number?: number;
+  showdown?: {
+    winner_id: number;
+    hand_name?: string;
+    hand_description?: string;
+  };
 }
 
 // Card Display Component
@@ -110,17 +130,35 @@ const PlayerSeat: React.FC<{ player: Player; isCurrentPlayer: boolean; position:
   }
 
   const finalPositionClass = positionClass || screenPositions[relativePosition] || 'bottom-0 left-1/2 -translate-x-1/2';
+  const lastAction = player.last_action;
+  const lastActionLabel = lastAction
+    ? lastAction.action === 'raise'
+      ? `Raise ${lastAction.amount}`
+      : lastAction.action === 'call'
+        ? `Call ${lastAction.amount}`
+        : lastAction.action === 'blind'
+          ? `Blind ${lastAction.amount}`
+          : lastAction.action === 'win'
+            ? `Won ${lastAction.amount}`
+            : lastAction.action
+    : null;
 
   return (
     <div className={`absolute ${finalPositionClass} w-32 ${isCurrentPlayer ? 'ring-4 ring-yellow-400' : ''}`}>
       <div className="bg-slate-700 rounded-lg p-3 text-center border-2 border-slate-600">
         <div className="text-sm font-bold text-slate-100 truncate">{player.name}</div>
-        <div className="text-xs text-slate-300 mt-1">💰 ${player.chips}</div>
+        <div className="text-xs text-slate-300 mt-1">${player.chips}</div>
         {player.current_bet > 0 && (
           <div className="text-xs text-yellow-400 font-bold mt-1">Bet: ${player.current_bet}</div>
         )}
         {player.folded && (
           <div className="text-xs text-red-400 font-bold mt-1">FOLDED</div>
+        )}
+        {!player.folded && lastActionLabel && (
+          <div className="text-xs text-slate-200 font-semibold mt-1">Last: {lastActionLabel}</div>
+        )}
+        {player.pending_active && (
+          <div className="text-[10px] text-slate-400 mt-1">Joining next hand</div>
         )}
         {player.is_dealer && (
           <div className="text-xs text-green-400 font-bold mt-1">Dealer</div>
@@ -157,7 +195,9 @@ export const PokerGameRoom: React.FC = () => {
   const [joined, setJoined] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [screen, setScreen] = useState<'landing' | 'create' | 'join' | 'game'>('landing');
-  const [numPlayers, setNumPlayers] = useState(6);
+  const [openSeats, setOpenSeats] = useState(2);
+  const [demoSeats, setDemoSeats] = useState(1);
+  const [llmSeats, setLlmSeats] = useState(2);
   const [startingChips, setStartingChips] = useState(1000);
   const [smallBlind, setSmallBlind] = useState(5);
   const [bigBlind, setBigBlind] = useState(10);
@@ -262,6 +302,16 @@ export const PokerGameRoom: React.FC = () => {
 
   // Create a new game
   const createNewGame = async () => {
+    const totalSeats = 1 + openSeats + demoSeats + llmSeats;
+    if (totalSeats < 2) {
+      setError('Add at least one more seat to start a game.');
+      return;
+    }
+    if (totalSeats > 9) {
+      setError('Max table size is 9 seats.');
+      return;
+    }
+
     setLoading(true);
     setError(null);
     try {
@@ -270,7 +320,9 @@ export const PokerGameRoom: React.FC = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           player_name: playerName || 'Dealer',
-          num_players: numPlayers,
+          open_seats: openSeats,
+          demo_seats: demoSeats,
+          llm_seats: llmSeats,
           starting_chips: startingChips,
           small_blind: smallBlind,
           big_blind: bigBlind
@@ -507,18 +559,59 @@ export const PokerGameRoom: React.FC = () => {
             </div>
 
             <div>
-              <Label htmlFor="numPlayers" className="text-slate-300">
-                Number of Players: {numPlayers}
+              <Label className="text-slate-300">
+                Table Composition
               </Label>
-              <input
-                id="numPlayers"
-                type="range"
-                min="2"
-                max="9"
-                value={numPlayers}
-                onChange={(e) => setNumPlayers(parseInt(e.target.value))}
-                className="mt-2 w-full"
-              />
+              <div className="mt-2 text-xs text-slate-400">
+                Total seats: {1 + openSeats + demoSeats + llmSeats} (max 9)
+              </div>
+              <div className="grid grid-cols-2 gap-3 mt-3">
+                <div>
+                  <Label htmlFor="openSeats" className="text-slate-300 text-sm">
+                    Open Seats
+                  </Label>
+                  <Input
+                    id="openSeats"
+                    type="number"
+                    min={0}
+                    max={8}
+                    value={openSeats}
+                    onChange={(e) => setOpenSeats(parseInt(e.target.value) || 0)}
+                    className="mt-2 bg-slate-700 border-slate-600 text-slate-100"
+                  />
+                </div>
+                <div>
+                  <Label htmlFor="demoSeats" className="text-slate-300 text-sm">
+                    Demo Bots
+                  </Label>
+                  <Input
+                    id="demoSeats"
+                    type="number"
+                    min={0}
+                    max={8}
+                    value={demoSeats}
+                    onChange={(e) => setDemoSeats(parseInt(e.target.value) || 0)}
+                    className="mt-2 bg-slate-700 border-slate-600 text-slate-100"
+                  />
+                </div>
+                <div>
+                  <Label htmlFor="llmSeats" className="text-slate-300 text-sm">
+                    LLM Bots
+                  </Label>
+                  <Input
+                    id="llmSeats"
+                    type="number"
+                    min={0}
+                    max={8}
+                    value={llmSeats}
+                    onChange={(e) => setLlmSeats(parseInt(e.target.value) || 0)}
+                    className="mt-2 bg-slate-700 border-slate-600 text-slate-100"
+                  />
+                </div>
+                <div className="flex items-center text-xs text-slate-400">
+                  You are always seated as a human player.
+                </div>
+              </div>
             </div>
 
             <div>
@@ -664,11 +757,13 @@ export const PokerGameRoom: React.FC = () => {
       (acc, player) => {
         if (player.player_type === 'demo') acc.demo += 1;
         else if (player.player_type === 'llm') acc.llm += 1;
+        else if (player.player_type === 'open') acc.open += 1;
         else acc.human += 1;
         return acc;
       },
-      { human: 0, demo: 0, llm: 0 }
+      { human: 0, demo: 0, llm: 0, open: 0 }
     );
+    const recentActions = (gameState.action_log || []).slice(-6).reverse();
 
     return (
       <div className="h-full bg-gradient-to-b from-green-900 to-green-800 flex flex-col p-2">
@@ -715,6 +810,18 @@ export const PokerGameRoom: React.FC = () => {
           </div>
         </div>
 
+        {gameState.showdown && (
+          <div className="bg-slate-800 rounded-lg p-2 border border-slate-700 mb-2 text-xs">
+            <div className="text-xs text-slate-400">Showdown Result</div>
+            <div className="text-sm text-slate-100 font-semibold mt-1">
+              {gameState.players[gameState.showdown.winner_id]?.name || 'Winner'} won with {gameState.showdown.hand_name || 'a strong hand'}
+            </div>
+            {gameState.showdown.hand_description && (
+              <div className="text-xs text-slate-300 mt-1">{gameState.showdown.hand_description}</div>
+            )}
+          </div>
+        )}
+
         {/* Game ID Display */}
         <div className="bg-slate-800 rounded-lg p-2 border border-slate-700 mb-2 text-xs">
           <p className="text-xs text-slate-400">Game ID (Share to invite)</p>
@@ -733,6 +840,7 @@ export const PokerGameRoom: React.FC = () => {
               <Badge variant="human">Human {playerTypeCounts.human}</Badge>
               <Badge variant="demo">Demo {playerTypeCounts.demo}</Badge>
               <Badge variant="llm">LLM {playerTypeCounts.llm}</Badge>
+              <Badge variant="open">Open {playerTypeCounts.open}</Badge>
             </div>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -744,16 +852,51 @@ export const PokerGameRoom: React.FC = () => {
                       ? 'demo'
                       : player.player_type === 'llm'
                         ? 'llm'
+                        : player.player_type === 'open'
+                          ? 'open'
                         : 'human'
                   }
                 >
                   {player.player_type ?? 'human'}
                 </Badge>
                 <span className="text-xs">{player.name}</span>
-                {!player.is_active && <span className="text-slate-500">(inactive)</span>}
+                {player.pending_active && <span className="text-slate-500">(joining next hand)</span>}
+                {!player.is_active && !player.pending_active && <span className="text-slate-500">(inactive)</span>}
               </div>
             ))}
           </div>
+        </div>
+
+        {/* Action Log */}
+        <div className="bg-slate-800 rounded-lg p-2 border border-slate-700 mb-2 text-xs">
+          <div className="text-xs text-slate-400 mb-2">Recent Actions</div>
+          {recentActions.length === 0 ? (
+            <div className="text-slate-500">No actions yet.</div>
+          ) : (
+            <div className="space-y-1">
+              {recentActions.map((entry, idx) => {
+                const actor = entry.player_id !== null ? gameState.players[entry.player_id]?.name : 'Table';
+                const actionText = entry.action === 'raise'
+                  ? `raised ${entry.amount} ${entry.note ? `(${entry.note})` : ''}`
+                  : entry.action === 'call'
+                    ? `called ${entry.amount}`
+                    : entry.action === 'blind'
+                      ? `${entry.note === 'small_blind' ? 'posted SB' : 'posted BB'} ${entry.amount}`
+                      : entry.action === 'win'
+                        ? `won ${entry.amount}`
+                        : entry.action === 'hand_start'
+                          ? `${entry.note || 'hand started'}`
+                        : entry.action === 'stage'
+                          ? `moved to ${entry.note}`
+                          : entry.action;
+                return (
+                  <div key={`${entry.action}-${idx}`} className="text-slate-200">
+                    <span className="font-semibold">{actor}</span> {actionText}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         {/* Table - Relative Container */}

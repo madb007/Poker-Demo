@@ -4,3 +4,7 @@ flask-socketio>=5.0.0
 python-socketio>=5.0.0
 python-engineio>=4.0.0
 pokerkit
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+pyro-ppl>=1.9.0
+torch>=2.1.0
