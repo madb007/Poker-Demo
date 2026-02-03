@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
+import { Badge } from '@/components/ui/badge';
 import { io, Socket } from 'socket.io-client';
 
 // Types
@@ -13,6 +14,7 @@ interface Card {
 interface Player {
   id: number;
   name: string;
+  player_type?: 'human' | 'demo' | 'llm';
   chips: number;
   hole_cards: Card[];
   is_dealer: boolean;
@@ -160,6 +162,7 @@ export const PokerGameRoom: React.FC = () => {
   const [smallBlind, setSmallBlind] = useState(5);
   const [bigBlind, setBigBlind] = useState(10);
   const [joinGameId, setJoinGameId] = useState('');
+  const [llmOnline, setLlmOnline] = useState<boolean | null>(null);
   const socketRef = useRef<Socket | null>(null);
 
   const API_URL = 'http://localhost:5001';
@@ -172,6 +175,29 @@ export const PokerGameRoom: React.FC = () => {
       if (socketRef.current) {
         socketRef.current.disconnect();
       }
+    };
+  }, []);
+
+  // Poll LLM health status
+  useEffect(() => {
+    let isMounted = true;
+    const checkHealth = async () => {
+      try {
+        const res = await fetch(`${API_URL}/llm/health`);
+        if (!isMounted) return;
+        setLlmOnline(res.ok);
+      } catch {
+        if (isMounted) {
+          setLlmOnline(false);
+        }
+      }
+    };
+
+    checkHealth();
+    const timer = setInterval(checkHealth, 5000);
+    return () => {
+      isMounted = false;
+      clearInterval(timer);
     };
   }, []);
 
@@ -634,6 +660,15 @@ export const PokerGameRoom: React.FC = () => {
 
     // Find viewer's own player object
     const viewerPlayer = (playerId !== null && gameState.players[playerId]) ? gameState.players[playerId] : null;
+    const playerTypeCounts = gameState.players.reduce(
+      (acc, player) => {
+        if (player.player_type === 'demo') acc.demo += 1;
+        else if (player.player_type === 'llm') acc.llm += 1;
+        else acc.human += 1;
+        return acc;
+      },
+      { human: 0, demo: 0, llm: 0 }
+    );
 
     return (
       <div className="h-full bg-gradient-to-b from-green-900 to-green-800 flex flex-col p-2">
@@ -684,6 +719,41 @@ export const PokerGameRoom: React.FC = () => {
         <div className="bg-slate-800 rounded-lg p-2 border border-slate-700 mb-2 text-xs">
           <p className="text-xs text-slate-400">Game ID (Share to invite)</p>
           <p className="text-sm font-mono text-slate-100 break-all">{gameState.game_id}</p>
+        </div>
+
+        {/* Bot Status Panel */}
+        <div className="bg-slate-800 rounded-lg p-2 border border-slate-700 mb-2 text-xs">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs text-slate-400">Bot Status</div>
+            <div className="flex items-center gap-2">
+              <Badge variant={llmOnline ? "llm" : "default"}>
+                <span className={`mr-1.5 inline-block h-2 w-2 rounded-full ${llmOnline ? "bg-emerald-400" : "bg-slate-500"}`} />
+                LLM {llmOnline === null ? "checking" : llmOnline ? "online" : "offline"}
+              </Badge>
+              <Badge variant="human">Human {playerTypeCounts.human}</Badge>
+              <Badge variant="demo">Demo {playerTypeCounts.demo}</Badge>
+              <Badge variant="llm">LLM {playerTypeCounts.llm}</Badge>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {gameState.players.map((player) => (
+              <div key={player.id} className="flex items-center gap-1.5 text-slate-300">
+                <Badge
+                  variant={
+                    player.player_type === 'demo'
+                      ? 'demo'
+                      : player.player_type === 'llm'
+                        ? 'llm'
+                        : 'human'
+                  }
+                >
+                  {player.player_type ?? 'human'}
+                </Badge>
+                <span className="text-xs">{player.name}</span>
+                {!player.is_active && <span className="text-slate-500">(inactive)</span>}
+              </div>
+            ))}
+          </div>
         </div>
 
         {/* Table - Relative Container */}
